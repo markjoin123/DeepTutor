@@ -277,7 +277,8 @@ class BuilderTests(unittest.IsolatedAsyncioTestCase):
 
         result = await builder.build(session_id="test", llm_config=config)
 
-        store.update_summary.assert_not_awaited()
+        store.update_summary.assert_awaited_once_with("test", "", 2)
+        self.assertLessEqual(result.token_count, result.budget)
         self.assertEqual(result.model_history, replay_history(recent))
         projected = deduplicate_user_images(result.model_history)
         self.assertEqual(projected[0]["content"][-1], distinct_image(1))
@@ -285,14 +286,15 @@ class BuilderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(message["role"] == "tool" for message in projected))
         self.assertEqual(rows, before)
 
-    async def test_summary_failure_keeps_existing_watermark(self):
+    async def test_summary_failure_advances_watermark_past_the_dropped_turn(self):
         rows = rows_with_parts("long text " * 60000)
         rows += rows_with_parts([image()], start=3)
         builder, store = self.builder(rows)
         builder._summarize.side_effect = RuntimeError("offline simulated failure")
         result = await builder.build(session_id="test", llm_config=CONFIG)
         builder._summarize.assert_awaited_once()
-        store.update_summary.assert_not_awaited()
+        store.update_summary.assert_awaited_once_with("test", "", 2)
+        self.assertLessEqual(result.token_count, result.budget)
         self.assertEqual(result.model_history, replay_history(rows[-2:]))
 
 

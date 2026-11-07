@@ -149,7 +149,8 @@ async def test_summary_failure_bounds_inline_history_preserves_exact_recall_and_
         session_id="s",
         llm_config=SimpleNamespace(model="gpt-6.1-sol", context_window=272000, max_tokens=8192),
     )
-    store.update_summary.assert_not_awaited()
+    store.update_summary.assert_awaited()
+    assert "learner_state" not in store.update_summary.await_args.args[1]
     assert built.token_count <= built.budget
     assert all(f"example {i} failed" in json.dumps(built.history_sources) for i in range(8))
     assert "example 7 failed" in json.dumps(built.model_history)
@@ -246,7 +247,7 @@ async def test_complete_json_near_budget_is_not_cut_as_an_incomplete_sentence(mo
 
 
 @pytest.mark.asyncio
-async def test_provider_truncated_memory_never_advances_watermark_even_if_json_parses(monkeypatch):
+async def test_provider_truncated_memory_is_not_stored_as_learner_memory(monkeypatch):
     from deeptutor.capabilities.mastery.memory import archive_id
     from deeptutor.services.session.model_history import history_groups
 
@@ -261,7 +262,8 @@ async def test_provider_truncated_memory_never_advances_watermark_even_if_json_p
         session_id="s",
         llm_config=SimpleNamespace(model="gpt-6.1-sol", context_window=272000, max_tokens=8192),
     )
-    store.update_summary.assert_not_awaited()
+    store.update_summary.assert_awaited()
+    assert all("learner_state" not in call.args[1] for call in store.update_summary.await_args_list)
     assert result.token_count <= result.budget
     assert "example 0 failed" in json.dumps(result.history_sources)
 
@@ -352,7 +354,8 @@ async def test_one_oversized_exchange_uses_exact_recall_without_cutting_tool_pai
         session_id="s",
         llm_config=SimpleNamespace(model="gpt-6.1-sol", context_window=272000, max_tokens=8192),
     )
-    store.update_summary.assert_not_awaited()
+    store.update_summary.assert_awaited()
+    assert "learner_state" not in store.update_summary.await_args.args[1]
     assert result.token_count <= result.budget
     assert "hs-tutor-2" in json.dumps(result.model_history)
     assert "distinct-0 " * 40000 in result.history_sources["hs-tutor-2"]
@@ -409,7 +412,10 @@ async def test_reasoning_allowance_does_not_replace_the_retained_memory_budget(
             model="reasoning-model", context_window=272000, max_tokens=configured_limit
         ),
     )
-    assert store.update_summary.await_count == int(saved)
+    saved_memory = any(
+        "learner_state" in str(call.args[1]) for call in store.update_summary.await_args_list
+    )
+    assert saved_memory is saved
     assert result.token_count <= 20000
     assert "example 0 failed" in json.dumps(result.history_sources)
 
@@ -449,7 +455,8 @@ async def test_a_truncated_memory_is_not_retried_on_every_turn(monkeypatch):
     third = await _build(holder, store)
 
     assert len(calls) == 1
-    store.update_summary.assert_not_awaited()
+    assert store.update_summary.await_count == 3
+    assert all("learner_state" not in call.args[1] for call in store.update_summary.await_args_list)
     for result in (first, second, third):
         assert result.token_count <= result.budget
         assert "example 0 failed" in json.dumps(result.history_sources)
@@ -466,11 +473,11 @@ async def test_raising_the_output_limit_retries_without_waiting_out_the_backoff(
     await _build(holder, store, max_tokens=4096)
     await _build(holder, store, max_tokens=4096)
     assert len(calls) == 1
-    store.update_summary.assert_not_awaited()
+    assert all("learner_state" not in call.args[1] for call in store.update_summary.await_args_list)
 
     await _build(holder, store, max_tokens=8192)
     assert len(calls) == 2
-    assert store.update_summary.await_count == 1
+    assert any("learner_state" in call.args[1] for call in store.update_summary.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -512,4 +519,5 @@ async def test_other_failures_are_still_retried_every_turn(monkeypatch):
             ),
         )
     assert len(calls) == 2
-    store.update_summary.assert_not_awaited()
+    assert store.update_summary.await_count == 2
+    assert all(call.args[1] != "not json" for call in store.update_summary.await_args_list)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import logging
@@ -27,6 +28,7 @@ from .ask_user_trace import (
     extract_ask_user_clarifications,
 )
 from .model_history import (
+    MODEL_TURN_KEY,
     SUMMARY_SNAPSHOT_NAME,
     history_groups,
     model_turn,
@@ -264,11 +266,70 @@ class _ContextSummaryAgent(BaseAgent):
         raise NotImplementedError
 
 
+#: Persisted when condensation fails and the retained tail had to be cut.
+_HARD_TRUNCATION_NOTICE = (
+    "[Earlier conversation was truncated to fit the history budget "
+    "after context condensation failed.]"
+)
+
+
+def _split_tool_units(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group an assistant tool call with the results that close it."""
+    units: list[list[dict[str, Any]]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        calls = message.get("tool_calls") or []
+        if message.get("role") == "assistant" and calls:
+            pending = {
+                call.get("id")
+                for call in calls
+                if isinstance(call, dict) and isinstance(call.get("id"), str)
+            }
+            unit = [message]
+            index += 1
+            while (
+                index < len(messages)
+                and messages[index].get("role") == "tool"
+                and messages[index].get("tool_call_id") in pending
+            ):
+                pending.discard(messages[index].get("tool_call_id"))
+                unit.append(messages[index])
+                index += 1
+            units.append(unit)
+            continue
+        units.append([message])
+        index += 1
+    return units
+
+
+def _last_message_id(rows: list[dict[str, Any]]) -> Any:
+    for row in reversed(rows):
+        if row.get("id"):
+            return row.get("id")
+    return None
+
+
+def _message_index(messages: list[dict[str, Any]], message_id: Any) -> int | None:
+    for index, item in enumerate(messages):
+        if str(item.get("id")) == str(message_id):
+            return index
+    return None
+
+
+def _set_field(container: dict[str, Any], key: str) -> Callable[[str], None]:
+    def apply(text: str) -> None:
+        container[key] = text
+
+    return apply
+
+
 class ContextBuilder:
     """Construct history against a bounded plan plus optional summary trace.
 
-    The budget is a planning target, not destructive truncation: the newest
-    non-empty message is retained even when that single message exceeds it.
+    Whole turns are dropped from the oldest end until the plan fits. A single
+    turn that still exceeds the budget is hard-truncated in the returned
+    history. Durable session rows are left unchanged.
     """
 
     def __init__(
@@ -411,6 +472,280 @@ class ContextBuilder:
         return count_tokens(build_history_text(self._build_history(summary, messages))) + sum(
             _provider_response_state_tokens(row) for row in messages
         )
+
+    def _assign_longest_tail(
+        self, text: str, apply: Callable[[str], None], measure: Callable[[], int], budget: int
+    ) -> None:
+        """Keep the newest suffix of ``text`` that still fits ``budget``."""
+
+        def fits(candidate: str) -> bool:
+            apply(candidate)
+            return measure() <= budget
+
+        if fits(text):
+            return
+        best_start = len(text)
+        low = 0
+        high = len(text)
+        while low <= high:
+            mid = (low + high) // 2
+            if fits(text[mid:]):
+                best_start = mid
+                high = mid - 1
+            else:
+                low = mid + 1
+        if fits(text[best_start:]):
+            return
+        candidate = text[best_start:]
+        while candidate:
+            candidate = candidate[max(1, len(candidate) // 4) :]
+            if fits(candidate):
+                return
+        apply("")
+
+    def _text_tail_for_budget(self, text: str, budget: int, measure: Callable[[str], int]) -> str:
+        """Return the newest suffix of ``text`` whose ``measure`` is within budget."""
+        holder = {"text": text}
+
+        def apply(candidate: str) -> None:
+            holder["text"] = candidate
+
+        self._assign_longest_tail(text, apply, lambda: measure(holder["text"]), budget)
+        return holder["text"]
+
+    def _fit_retained_history(
+        self,
+        rows: list[dict[str, Any]],
+        summary: str,
+        route: dict[str, str] | None,
+        budget: int,
+    ) -> tuple[list[dict[str, Any]], str, bool]:
+        """Copy ``rows`` and drop or cut content until the history plan fits.
+
+        The caller's rows are not mutated. The returned summary changes only
+        when the summary alone exceeds the budget.
+        """
+        fitted = deepcopy(rows)
+        groups = history_groups(fitted)
+        while len(groups) > 1 and self._model_tokens(fitted, summary, route) > budget:
+            groups.pop(0)
+            fitted = [row for group in groups for row in group]
+        truncated_within = self._model_tokens(fitted, summary, route) > budget
+        if truncated_within and self._hard_truncate_overflow():
+            self._shrink_fitted_rows(fitted, summary, route, budget)
+        if self._hard_truncate_overflow() and self._model_tokens(fitted, summary, route) > budget:
+            truncated_within = True
+            summary = self._text_tail_for_budget(
+                summary,
+                budget,
+                lambda text: self._model_tokens([], text, route),
+            )
+            fitted = []
+            if self._model_tokens([], summary, route) > budget:
+                summary = ""
+        return fitted, summary, truncated_within
+
+    def _hard_truncate_overflow(self) -> bool:
+        """Cut a single oversized group so the returned history fits.
+
+        Subclasses that replace an oversized exchange with their own bounded
+        pointer can return False and keep that group intact.
+        """
+        return True
+
+    def _shrink_fitted_rows(
+        self,
+        rows: list[dict[str, Any]],
+        summary: str,
+        route: dict[str, str] | None,
+        budget: int,
+    ) -> None:
+        if any(model_turn(row) is not None for row in rows):
+            self._shrink_model_group(rows, summary, route, budget)
+            return
+        for row in rows:
+            if self._model_tokens(rows, summary, route) <= budget:
+                return
+            content = str(row.get("content") or "")
+            if content:
+                self._assign_longest_tail(
+                    content,
+                    _set_field(row, "content"),
+                    lambda: self._model_tokens(rows, summary, route),
+                    budget,
+                )
+            if self._model_tokens(rows, summary, route) <= budget:
+                return
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("provider_response_state") is not None:
+                cleared = dict(metadata)
+                cleared.pop("provider_response_state", None)
+                row["metadata"] = cleared
+
+    def _shrink_model_group(
+        self,
+        rows: list[dict[str, Any]],
+        summary: str,
+        route: dict[str, str] | None,
+        budget: int,
+    ) -> None:
+        index = next(i for i, row in enumerate(rows) if model_turn(row) is not None)
+        record = deepcopy(model_turn(rows[index]))
+        units = _split_tool_units(list(record.get("messages") or []))
+        if not units:
+            return
+
+        def install() -> None:
+            installed = deepcopy(record)
+            installed["messages"] = [deepcopy(message) for unit in units for message in unit]
+            metadata = dict(rows[index].get("metadata") or {})
+            metadata[MODEL_TURN_KEY] = installed
+            rows[index]["metadata"] = metadata
+
+        install()
+        while len(units) > 1 and self._model_tokens(rows, summary, route) > budget:
+            units.pop(0)
+            install()
+        guard = 0
+        while self._model_tokens(rows, summary, route) > budget and guard < 64:
+            guard += 1
+            if not self._shrink_one_model_field(units, install, summary, route, rows, budget):
+                break
+
+    def _shrink_one_model_field(
+        self,
+        units: list[list[dict[str, Any]]],
+        install: Callable[[], None],
+        summary: str,
+        route: dict[str, str] | None,
+        rows: list[dict[str, Any]],
+        budget: int,
+    ) -> bool:
+        """Shorten the oldest remaining model-visible text. Keep tool pairs intact."""
+
+        def measure() -> int:
+            install()
+            return self._model_tokens(rows, summary, route)
+
+        for message in (item for unit in units for item in unit):
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                self._assign_longest_tail(
+                    content,
+                    _set_field(message, "content"),
+                    measure,
+                    budget,
+                )
+                return True
+            if isinstance(content, list) and content:
+                message["content"] = content[1:] if len(content) > 1 else ""
+                install()
+                return True
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                arguments = function.get("arguments") if isinstance(function, dict) else None
+                if isinstance(arguments, str) and arguments:
+                    self._assign_longest_tail(
+                        arguments,
+                        _set_field(function, "arguments"),
+                        measure,
+                        budget,
+                    )
+                    return True
+            if message.get("_provider_response_state"):
+                message.pop("_provider_response_state", None)
+                install()
+                return True
+        return False
+
+    def _rows_transcript(self, rows: list[dict[str, Any]], route: dict[str, str] | None) -> str:
+        lines: list[str] = []
+        for message in replay_history(rows, route=route):
+            content = message.get("content")
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            elif content is None:
+                content = ""
+            else:
+                content = str(content)
+            calls = message.get("tool_calls")
+            if calls:
+                content = f"{content}\n{json.dumps(calls, ensure_ascii=False)}"
+            if str(content).strip():
+                lines.append(f"{message.get('role', 'user')}: {content}")
+        return "\n\n".join(lines)
+
+    def _bounded_fallback_summary(
+        self,
+        summary: str,
+        rows: list[dict[str, Any]],
+        route: dict[str, str] | None,
+        budget: int,
+    ) -> str:
+        """A deterministic stand-in for turns condensation could not fold in."""
+        transcript = self._rows_transcript(rows, route)
+        combined = "\n\n".join(part for part in (summary.strip(), transcript.strip()) if part)
+        notice = _HARD_TRUNCATION_NOTICE
+        notice_cost = self._model_tokens([], notice, route)
+        body_budget = budget - notice_cost if notice_cost < budget else 0
+        body = (
+            self._text_tail_for_budget(
+                combined,
+                body_budget,
+                lambda text: self._model_tokens([], text, route),
+            )
+            if body_budget
+            else ""
+        )
+        noticed = f"{notice}\n\n{body}" if body else notice
+        if self._model_tokens([], noticed, route) <= budget:
+            return noticed
+        return self._text_tail_for_budget(
+            noticed,
+            budget,
+            lambda text: self._model_tokens([], text, route),
+        )
+
+    def _fallback_watermark(
+        self,
+        *,
+        original_rows: list[dict[str, Any]],
+        fitted_rows: list[dict[str, Any]],
+        summary: str,
+        truncated_within: bool,
+        route: dict[str, str] | None,
+        budget: int,
+    ) -> tuple[str, Any] | None:
+        """Return the summary and message id to persist after a failed condensation."""
+        if truncated_within:
+            cover = _last_message_id(original_rows)
+            if cover is None:
+                return None
+            return (
+                self._bounded_fallback_summary(summary, fitted_rows, route, budget),
+                cover,
+            )
+        fitted_ids = {row.get("id") for row in fitted_rows}
+        dropped = [
+            row for row in original_rows if row.get("id") not in fitted_ids and row.get("id")
+        ]
+        if not dropped:
+            return None
+        return summary, dropped[-1].get("id")
+
+    @staticmethod
+    def _watermark_is_newer(messages: list[dict[str, Any]], previous: Any, candidate: Any) -> bool:
+        if candidate in (None, "", 0):
+            return False
+        if previous in (None, "", 0):
+            return True
+        previous_at = _message_index(messages, previous)
+        candidate_at = _message_index(messages, candidate)
+        if candidate_at is None:
+            return False
+        if previous_at is None:
+            return True
+        return candidate_at > previous_at
 
     async def _summarize(
         self,
@@ -754,11 +1089,12 @@ class ContextBuilder:
             events = []
             # Keep private transcript/provider details out of diagnostics.
             logger.warning(
-                "Context condensation failed (%s); bounding recent history without advancing its watermark",
+                "Context condensation failed (%s); bounding recent history with a hard-truncation watermark",
                 type(exc).__name__,
             )
 
-        if summarize_ok and new_summary:
+        condensation_failed = not (summarize_ok and new_summary)
+        if not condensation_failed:
             # Advance the watermark only on a successful summarize — never
             # past turns that were not actually folded in.
             up_to_msg_id = summary_up_to_msg_id
@@ -768,17 +1104,32 @@ class ContextBuilder:
             stored_summary = new_summary
             retained_rows = recent_messages
         else:
-            # Degrade for this turn only: keep the stale summary and as many
-            # unsummarized turns as fit; nothing is marked as summarized, so
-            # the next turn retries with the full material.
+            # Keep the stale summary for this turn. A fallback watermark below
+            # records the prefix we are about to drop so the next turn does
+            # not retry the same unsummarized material.
             retained_rows = unsummarized
-        retained_groups = history_groups(retained_rows)
-        while (
-            len(retained_groups) > 1
-            and self._model_tokens(retained_rows, stored_summary, route) > budget
-        ):
-            retained_groups.pop(0)
-            retained_rows = [row for group in retained_groups for row in group]
+        retained_rows, stored_summary, truncated_within = self._fit_retained_history(
+            retained_rows, stored_summary, route, budget
+        )
+        if condensation_failed:
+            fallback = self._fallback_watermark(
+                original_rows=unsummarized,
+                fitted_rows=retained_rows,
+                summary=stored_summary,
+                truncated_within=truncated_within,
+                route=route,
+                budget=budget,
+            )
+            if fallback is not None:
+                fallback_summary, watermark = fallback
+                if self._watermark_is_newer(messages, summary_up_to_msg_id, watermark):
+                    await self.store.update_summary(session_id, fallback_summary, watermark)
+                    # The fitted rows are already within budget for this turn.
+                    # Once the watermark covers a within-group cut, the next
+                    # turn must not reload the uncut row: keep only the excerpt.
+                    if truncated_within and self._hard_truncate_overflow():
+                        stored_summary = fallback_summary
+                        retained_rows = []
         final_history = self._build_history(stored_summary, retained_rows)
 
         final_text = build_history_text(final_history)

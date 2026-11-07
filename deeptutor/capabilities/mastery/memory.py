@@ -126,6 +126,11 @@ class MasteryContextBuilder(ContextBuilder):
     def _history_budget(self, llm_config):
         return min(super()._history_budget(llm_config), 20_000)
 
+    def _hard_truncate_overflow(self) -> bool:
+        # One oversized exchange stays intact so ``build`` can replace it with
+        # an exact-recall pointer instead of a partial tool transcript.
+        return False
+
     def _summary_budget(self, budget, llm_config=None):
         return min(super()._summary_budget(budget, llm_config), 4096)
 
@@ -299,6 +304,7 @@ class MasteryContextBuilder(ContextBuilder):
                 raise ValueError("Complete tutoring memory exceeded its retained budget")
             return result, events
         except (ValueError, TypeError) as exc:
-            # ContextBuilder retries on a later turn; its watermark stays put.
+            # The invalid output is not stored. ContextBuilder records a
+            # hard-truncation watermark so the same prefix is not resent.
             reason = "invalid JSON" if isinstance(exc, json.JSONDecodeError) else str(exc)
             raise ValueError(f"Tutoring memory: {reason}") from exc

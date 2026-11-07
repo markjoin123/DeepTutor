@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -654,7 +656,7 @@ class TestContextBuilderSummarizePaths:
         store.update_summary.assert_awaited_once_with("s1", "NEW SUMMARY", 3)
 
     @pytest.mark.asyncio
-    async def test_failure_keeps_watermark_and_degrades_for_turn(self) -> None:
+    async def test_failure_advances_fallback_watermark_and_keeps_recent_turn(self) -> None:
         messages = [
             {"id": 1, "role": "user", "content": "old " * 100},
             {"id": 2, "role": "assistant", "content": "older reply " * 100},
@@ -667,9 +669,11 @@ class TestContextBuilderSummarizePaths:
 
         result = await builder.build(session_id="s1", llm_config=_small_window_cfg())
 
-        # Nothing may be marked as summarized on failure — otherwise the
-        # unfolded turns are dropped from every future context build.
-        store.update_summary.assert_not_called()
+        # The failed turn is not described as summarized. The watermark moves
+        # past the dropped prefix so the next build does not resend it, while
+        # the recent turn and the previous summary stay available.
+        store.update_summary.assert_awaited_once_with("s1", "OLD SUMMARY", 3)
+        assert result.token_count <= result.budget
         assert result.conversation_summary == "OLD SUMMARY"
         assert result.conversation_history[0] == {
             "role": "system",
@@ -677,6 +681,7 @@ class TestContextBuilderSummarizePaths:
         }
         contents = [m["content"] for m in result.conversation_history]
         assert "recent answer" in contents
+        assert "mid " * 400 not in contents
 
     @pytest.mark.asyncio
     async def test_branch_switch_discards_sibling_summary(self) -> None:
@@ -763,7 +768,7 @@ async def test_compaction_uses_discovered_prompt_and_preserves_sources_and_priva
 @pytest.mark.parametrize(
     "failure", ["missing_prompt", "empty", "reasoning_only", "exception", "partial_error"]
 )
-async def test_failed_compaction_preserves_durable_history_and_retries(
+async def test_failed_compaction_preserves_durable_history_and_bounds_prefix(
     sqlite_store: SQLiteSessionStore,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -798,23 +803,166 @@ async def test_failed_compaction_preserves_durable_history_and_retries(
 
     session = await sqlite_store.get_session(session_id)
     assert session["compressed_summary"] == "PRIOR SUMMARY [doc:7]"
-    assert session["summary_up_to_msg_id"] == watermark
+    # The oversized unsummarized user turn is behind a hard-truncation
+    # watermark. Its text stays in the store, but the next build will not
+    # send it to the summarizer again.
+    assert session["summary_up_to_msg_id"] == original[-2]["id"]
+    assert session["summary_up_to_msg_id"] != watermark
+    assert result.token_count <= result.budget
     assert result.conversation_summary == "PRIOR SUMMARY [doc:7]"
     assert result.conversation_history[-1]["content"] == "Recent answer"
     assert result.conversation_history[-1]["_provider_response_state"] == {
         "reasoning_content": "private replay state"
     }
+    assert "RETRY_MARKER" not in result.context_text
     assert await sqlite_store.get_messages_for_context(session_id) == original
 
+    calls: list[str] = []
+
     async def retry(_self: _ContextSummaryAgent, **kwargs: Any) -> AsyncIterator[str]:
-        assert "RETRY_MARKER" in kwargs["user_prompt"]
+        calls.append(str(kwargs.get("user_prompt") or ""))
         yield "Recovered summary [doc:7] [doc:9]"
 
     monkeypatch.setattr(_ContextSummaryAgent, "stream_llm", retry)
     retried = await ContextBuilder(sqlite_store).build(
         session_id=session_id, llm_config=_small_window_cfg()
     )
-    assert retried.conversation_summary == "Recovered summary [doc:7] [doc:9]"
+    assert calls == []
+    assert retried.token_count <= retried.budget
+    assert "RETRY_MARKER" not in retried.context_text
+    assert retried.conversation_history[-1]["content"] == "Recent answer"
     session = await sqlite_store.get_session(session_id)
+    assert session["compressed_summary"] == "PRIOR SUMMARY [doc:7]"
     assert session["summary_up_to_msg_id"] == original[-2]["id"]
     assert await sqlite_store.get_messages_for_context(session_id) == original
+
+
+def _assert_tool_pairs(messages: list[dict[str, Any]]) -> None:
+    pending: list[str] = []
+    for message in messages:
+        if pending and message.get("role") != "tool":
+            raise AssertionError(f"tool calls closed out of order: {pending}")
+        for call in message.get("tool_calls") or []:
+            pending.append(call["id"])
+        if message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            assert call_id in pending
+            pending.remove(call_id)
+    assert pending == []
+
+
+def _large_window_cfg() -> SimpleNamespace:
+    return SimpleNamespace(
+        model="synthetic-model",
+        binding="openai",
+        context_window=1_048_576,
+        max_tokens=4096,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succeeds", [False, True])
+async def test_single_oversized_group_stays_within_history_budget(
+    sqlite_store: SQLiteSessionStore,
+    succeeds: bool,
+) -> None:
+    """A retained group larger than the plan cannot survive, even after a summary."""
+    session = await sqlite_store.create_session()
+    session_id = session["id"]
+    huge = "alpha " * 150_000
+    for role, text in (
+        ("user", "Earlier question"),
+        ("assistant", "Earlier answer"),
+        ("user", "Latest question"),
+        ("assistant", huge),
+    ):
+        await sqlite_store.add_message(session_id, role, text)
+    original = await sqlite_store.get_messages_for_context(session_id)
+    builder = ContextBuilder(sqlite_store)
+    summary = (
+        AsyncMock(return_value=("Small successful summary", []))
+        if succeeds
+        else AsyncMock(side_effect=ValueError("fixture"))
+    )
+    with patch.object(builder, "_summarize", summary):
+        result = await builder.build(session_id=session_id, llm_config=_large_window_cfg())
+
+    assert result.budget == MAX_HISTORY_PLAN_TOKENS
+    assert result.token_count <= result.budget
+    assert huge not in result.context_text
+    assert huge not in result.conversation_summary
+    assert huge not in json.dumps(result.model_history)
+    if not succeeds:
+        assert result.conversation_summary.startswith("[Earlier conversation was truncated")
+    assert await sqlite_store.get_messages_for_context(session_id) == original
+    stored = await sqlite_store.get_session(session_id)
+    assert stored["summary_up_to_msg_id"] not in (0, None, "")
+
+    again = (
+        AsyncMock(return_value=("Small successful summary", []))
+        if succeeds
+        else AsyncMock(side_effect=ValueError("fixture"))
+    )
+    follow_up = ContextBuilder(sqlite_store)
+    with patch.object(follow_up, "_summarize", again):
+        second = await follow_up.build(session_id=session_id, llm_config=_large_window_cfg())
+    assert second.token_count <= second.budget
+    assert huge not in second.context_text
+    assert huge not in second.conversation_summary
+    assert huge not in json.dumps(second.model_history)
+    assert await sqlite_store.get_messages_for_context(session_id) == original
+    if not succeeds:
+        again.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succeeds", [False, True])
+async def test_oversized_model_turn_stays_within_budget_and_keeps_tool_pairs(
+    sqlite_store: SQLiteSessionStore,
+    succeeds: bool,
+) -> None:
+    from tests.services.session.test_model_history import turn_record
+
+    session = await sqlite_store.create_session()
+    session_id = session["id"]
+    huge = "evidence " * 160_000
+    await sqlite_store.add_message(session_id, "user", "Earlier question")
+    await sqlite_store.add_message(session_id, "assistant", "Earlier answer")
+    await sqlite_store.add_message(session_id, "user", "Latest question")
+    await sqlite_store.add_message(
+        session_id,
+        "assistant",
+        "Displayed answer",
+        metadata={"model_turn": turn_record(huge)},
+    )
+    original = await sqlite_store.get_messages_for_context(session_id)
+    builder = ContextBuilder(sqlite_store)
+    summary = (
+        AsyncMock(return_value=("Small successful summary", []))
+        if succeeds
+        else AsyncMock(side_effect=ValueError("fixture"))
+    )
+    with patch.object(builder, "_summarize", summary):
+        result = await builder.build(session_id=session_id, llm_config=_large_window_cfg())
+
+    assert result.budget == MAX_HISTORY_PLAN_TOKENS
+    assert result.token_count <= result.budget
+    _assert_tool_pairs(result.model_history or [])
+    assert huge not in json.dumps(result.model_history)
+    assert huge not in result.conversation_summary
+    assert await sqlite_store.get_messages_for_context(session_id) == original
+
+    again = (
+        AsyncMock(return_value=("Small successful summary", []))
+        if succeeds
+        else AsyncMock(side_effect=ValueError("fixture"))
+    )
+    follow_up = ContextBuilder(sqlite_store)
+    with patch.object(follow_up, "_summarize", again):
+        second = await follow_up.build(session_id=session_id, llm_config=_large_window_cfg())
+    assert second.token_count <= second.budget
+    _assert_tool_pairs(second.model_history or [])
+    assert huge not in json.dumps(second.model_history)
+    assert await sqlite_store.get_messages_for_context(session_id) == original
+    if not succeeds:
+        again.assert_not_awaited()
