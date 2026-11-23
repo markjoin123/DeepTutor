@@ -267,13 +267,43 @@ def selected_scope(topic: Any, progress: Any, kp_id: str) -> dict[str, list[str]
     return scope
 
 
+def _ready_index_storage(directory: Path, base_dir: Path, kb_name: str) -> Path | None:
+    """Return the store a knowledge base's readiness check already accepts.
+
+    GraphRAG, LightRAG and PageIndex publish a synthetic provider signature.
+    LlamaIndex records the embedding that built the index, which may be the
+    knowledge base's own model rather than the process-global default. The
+    provider probe (``latest_ready_provider_version``) is what marks that
+    store ready. LlamaIndex still prefers the bound embedding when that
+    version is present, matching the signature its read path selects.
+    """
+    from deeptutor.services.rag.embedding_binding import entry_signature
+    from deeptutor.services.rag.factory import provider_uses_embedding_versions
+    from deeptutor.services.rag.index_probe import latest_ready_provider_version
+    from deeptutor.services.rag.index_versioning import resolve_storage_dir_for_read
+    from deeptutor.services.rag.provider_binding import (
+        load_kb_config_entry,
+        resolve_bound_provider,
+    )
+
+    provider = resolve_bound_provider(base_dir, kb_name)
+    if provider_uses_embedding_versions(provider):
+        signature = entry_signature(load_kb_config_entry(base_dir, kb_name))
+        matched = resolve_storage_dir_for_read(directory, signature)
+        if matched is not None:
+            return matched
+    ready = latest_ready_provider_version(directory, provider)
+    storage_path = (ready or {}).get("storage_path")
+    if not storage_path:
+        return None
+    return Path(str(storage_path))
+
+
 def scope_snapshot(
     topic: Any, progress: Any, kp_id: str, *, prepare_legacy: bool = False
 ) -> tuple[str, dict[str, Any]]:
     """Authorize KBs first, then fingerprint published page catalogs and selection."""
     from deeptutor.multi_user.knowledge_access import resolve_for_rag
-    from deeptutor.services.rag.embedding_signature import signature_from_embedding_config
-    from deeptutor.services.rag.index_versioning import resolve_storage_dir_for_read
     from deeptutor.services.workspace.knowledge import learning_source_access
 
     scope = selected_scope(topic, progress, kp_id)
@@ -289,7 +319,7 @@ def scope_snapshot(
             if resource is None:
                 raise LessonUnavailable("Access to a selected knowledge base is unavailable.")
             directory = Path(resource.base_dir) / resource.name
-            storage = resolve_storage_dir_for_read(directory, signature_from_embedding_config())
+            storage = _ready_index_storage(directory, Path(resource.base_dir), resource.name)
             if storage is None:
                 raise LessonUnavailable(
                     "A selected knowledge base has no compatible completed index. Re-index it or select a ready knowledge base."
